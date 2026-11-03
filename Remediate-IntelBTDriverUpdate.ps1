@@ -29,7 +29,7 @@
     Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.2
+    Version 2.1.3
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -56,7 +56,7 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.2'
+$script:ScriptVersion = '2.1.3'
 $script:PackageRole = 'Remediate'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
@@ -166,11 +166,63 @@ function Test-BlockedVersionText {
 
 function Test-BlockedBluetoothText {
     param([string]$Text)
-    if (-not (Test-BlockedVersionText $Text)) { return $false }
-    if ($Text -notmatch 'Intel') { return $false }
-    if ($Text -match 'Bluetooth') { return $true }
-    if ($Text -match [regex]::Escape($script:BluetoothClassGuid)) { return $true }
+    # Whole-file AND is wrong for a USO database: the installed adapter name
+    # and some other package's version can share one file. Require the version
+    # and the Intel Bluetooth words in the same small window.
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    $radius = 200
+    foreach ($version in $script:BlockedVersions) {
+        $pattern = '(?<!\d)' + [regex]::Escape($version) + '(?!\d)'
+        $found = [regex]::Matches($Text, $pattern)
+        foreach ($hit in $found) {
+            $start = $hit.Index - $radius
+            if ($start -lt 0) { $start = 0 }
+            $length = $hit.Length + ($radius * 2)
+            if (($start + $length) -gt $Text.Length) { $length = $Text.Length - $start }
+            $window = $Text.Substring($start, $length)
+            if ($window -notmatch 'Intel') { continue }
+            if ($window -match 'Bluetooth') { return $true }
+            if ($window -match [regex]::Escape($script:BluetoothClassGuid)) { return $true }
+        }
+    }
     return $false
+}
+
+function Get-BlockedMatchExcerpt {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $radius = 80
+    foreach ($version in $script:BlockedVersions) {
+        $pattern = '(?<!\d)' + [regex]::Escape($version) + '(?!\d)'
+        $found = [regex]::Matches($Text, $pattern)
+        foreach ($hit in $found) {
+            $start = $hit.Index - $radius
+            if ($start -lt 0) { $start = 0 }
+            $length = $hit.Length + ($radius * 2)
+            if (($start + $length) -gt $Text.Length) { $length = $Text.Length - $start }
+            $window = $Text.Substring($start, $length)
+            if ($window -notmatch 'Intel') { continue }
+            if ($window -notmatch 'Bluetooth' -and $window -notmatch [regex]::Escape($script:BluetoothClassGuid)) { continue }
+            $flat = ([regex]::Replace($window, '[^\x20-\x7E]', ' ') -replace '\s+', ' ').Trim()
+            if ($flat.Length -gt 180) { $flat = $flat.Substring(0, 180) }
+            return $flat
+        }
+    }
+    return ''
+}
+
+function Get-FileMatchExcerpt {
+    param([string]$Path)
+    try { $bytes = [IO.File]::ReadAllBytes($Path) } catch { return '' }
+    $samples = New-Object 'System.Collections.Generic.List[string]'
+    [void]$samples.Add([Text.Encoding]::GetEncoding(28591).GetString($bytes))
+    try { [void]$samples.Add([Text.Encoding]::Unicode.GetString($bytes)) } catch { }
+    try { [void]$samples.Add([Text.Encoding]::BigEndianUnicode.GetString($bytes)) } catch { }
+    foreach ($sample in $samples) {
+        $excerpt = Get-BlockedMatchExcerpt $sample
+        if (-not [string]::IsNullOrWhiteSpace($excerpt)) { return $excerpt }
+    }
+    return ''
 }
 
 function Test-BytesContainBlockedVersion {
@@ -335,8 +387,12 @@ function Get-UsoHits {
             continue
         }
         # Version text alone is not enough. A shared store can mention 24.70.0.4
-        # for a different package. Require Intel plus Bluetooth in the same file.
+        # for a different package. Require Intel plus Bluetooth near that version.
         if (Test-FileHasBlockedBluetooth $file.FullName) {
+            $excerpt = ''
+            try { $excerpt = Get-FileMatchExcerpt $file.FullName } catch { }
+            if ([string]::IsNullOrWhiteSpace($excerpt)) { $excerpt = 'matched, excerpt unreadable' }
+            Write-Log "USO match $($file.Name): $excerpt"
             [void]$hits.Add($file.FullName)
         }
     }
@@ -516,8 +572,10 @@ function Write-EnvironmentLog {
                 continue
             }
             $props = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+            $keep = '^(WUServer|WUStatusServer|TargetGroup|TargetGroupEnabled|DisableDualScan|DoNotConnectToWindowsUpdateInternetLocations|UseWUServer|NoAutoUpdate|AUOptions|UseUpdateClassPolicySource|AllowMUUpdateService|ExcludeWUDriversInQualityUpdate|AllowOptionalContent|SetPolicyDrivenUpdateSourceFor\w+|DriverUpdateEnrolled|PauseQualityUpdates|PauseFeatureUpdates)$'
             foreach ($property in @($props.PSObject.Properties)) {
                 if ($property.Name -like 'PS*') { continue }
+                if ($property.Name -notmatch $keep) { continue }
                 if ($property.Value -is [byte[]]) { continue }
                 $value = [string]$property.Value
                 if ($value.Length -gt 300) { $value = $value.Substring(0, 300) }
@@ -953,6 +1011,33 @@ function Set-UsoSuppressWindow {
     Write-Log "Hidden update remains in USO text. Detection will ignore that text until $until"
 }
 
+function Get-UsoReplayFlag {
+    return (Join-Path $script:LogDir 'uso-replay-until.txt')
+}
+
+function Test-TimeFlagActive {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try { $text = [IO.File]::ReadAllText($Path).Trim() } catch { return $false }
+    $until = [datetime]::MinValue
+    $styles = [Globalization.DateTimeStyles]::RoundtripKind -bor [Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [datetime]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$until)) { return $false }
+    return ($until.ToUniversalTime() -gt [datetime]::UtcNow)
+}
+
+function Test-UsoReplayActive {
+    return (Test-TimeFlagActive (Get-UsoReplayFlag))
+}
+
+function Set-UsoReplayWindow {
+    $until = [datetime]::UtcNow.AddHours(24).ToString('o')
+    if (-not (Test-Path -LiteralPath $script:LogDir)) {
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+    }
+    [IO.File]::WriteAllText((Get-UsoReplayFlag), $until)
+    Write-Log "USO rewrote the blocked text and Windows Update had no matching update. Another delete is skipped until $until"
+}
+
 function Get-ComplianceReasons {
     param($Scan, $Staged, $UsoHits, $DownloadFolders)
     $reasons = New-Object 'System.Collections.Generic.List[string]'
@@ -1131,6 +1216,13 @@ function Invoke-Remediate {
     $staged = @(Get-StagedBlockedDrivers $active)
     $uso = @(Get-UsoHits)
     $downloads = @(Get-BlockedDownloadFolders)
+    $removableStaged = @($staged | Where-Object { -not $_.InUse -and -not $_.Inbox })
+    # A previous run already deleted this USO text and the rescan wrote it back
+    # while Windows Update had nothing to hide. Do not stop the update stack again.
+    if ((Test-UsoReplayActive) -and @($scan.Updates).Count -eq 0 -and @($downloads).Count -eq 0 -and @($uso).Count -gt 0 -and $removableStaged.Count -eq 0) {
+        Write-Log 'USO still has the blocked text after an earlier delete. Windows Update has no matching update. Leaving the update stack running.'
+        Write-Status -Code 1 -Message 'Still present: USO recreated a blocked Intel Bluetooth reference and Windows Update returned no update to hide. Decline 24.70.0.4 and 24.80.0.2 in every Intune driver update policy. The update stack was not stopped again.'
+    }
     $cleanup = Invoke-TargetedCleanup -DownloadFolders $downloads -UsoHits $uso
     $removedStaged = @(Remove-StagedBlockedDrivers $staged)
     Start-SettingsRefresh
@@ -1141,7 +1233,11 @@ function Invoke-Remediate {
     $downloads2 = @(Get-BlockedDownloadFolders)
     $uso2 = @(Get-UsoHits)
     $offeredAgain = @($scan2.Updates | Where-Object { -not $_.IsHidden })
+    $usoCameBack = $false
     if (($uso2.Count -gt 0 -or $downloads2.Count -gt 0) -and $offeredAgain.Count -eq 0) {
+        if (@($uso2).Count -gt 0 -and @($scan2.Updates).Count -eq 0 -and @($downloads2).Count -eq 0) {
+            $usoCameBack = $true
+        }
         $cleanup2 = Invoke-TargetedCleanup -DownloadFolders $downloads2 -UsoHits $uso2
         $uso2 = @(Get-UsoHits)
         $downloads2 = @(Get-BlockedDownloadFolders)
@@ -1151,13 +1247,17 @@ function Invoke-Remediate {
         }
     }
     $reasons = @(Get-ComplianceReasons -Scan $scan2 -Staged $staged2 -UsoHits $uso2 -DownloadFolders $downloads2)
+    if ($usoCameBack) {
+        Set-UsoReplayWindow
+        $reasons = @(@($reasons) + @('USO recreated the blocked text during the rescan and Windows Update has no matching update'))
+    }
     $summary = Get-ActionSummary -FirstScan $scan -SecondScan $scan2 -RemovedStaged $removedStaged -RemovedDownloads $cleanup.Downloads -RemovedUso $cleanup.Uso -ActiveDrivers $active2
     # A file that still contains the offer is what Settings shows. Do not report
     # success while that file remains. The 24-hour window is only for a later
     # detection, after the file was actually removed and the update is hidden.
     if ($reasons.Count -gt 0) {
         $policyNote = ''
-        $unseen = @($reasons | Where-Object { $_ -like 'USO UpdateStore*' -or $_ -like 'Inconclusive:*' -or $_ -like '*Hide failed*' -or $_ -like '*mandatory*' })
+        $unseen = @($reasons | Where-Object { $_ -like 'USO*' -or $_ -like 'Inconclusive:*' -or $_ -like '*Hide failed*' -or $_ -like '*mandatory*' })
         if ($unseen.Count -gt 0) {
             $policyNote = ' Decline 24.70.0.4 and 24.80.0.2 in every Intune driver update policy if a local hide does not stick.'
         }
@@ -1190,6 +1290,10 @@ function Invoke-SelfTest {
     Assert-Self (-not (Test-BlockedBluetoothText 'Intel Bluetooth 24.70.0.40')) 'version boundary'
     Assert-Self (-not (Test-BlockedBluetoothText 'Bluetooth only 24.80.0.2')) 'missing intel'
     Assert-Self (-not (Test-BlockedBluetoothText 'Intel Bluetooth driver')) 'missing version'
+    $far = 'Intel(R) Wireless Bluetooth(R)' + ('z' * 500) + '24.70.0.4'
+    Assert-Self (-not (Test-BlockedBluetoothText $far)) 'tokens far apart'
+    $near = 'Intel Wireless Bluetooth ' + ('n' * 40) + ' 24.70.0.4'
+    Assert-Self (Test-BlockedBluetoothText $near) 'tokens within window'
     Assert-Self (Test-BlockedVersionText 'DriverVer=07/18/2026,24.70.0.4') 'inf driverver'
     Assert-Self (-not (Test-BlockedVersionText '24.70.0.40')) 'boundary helper'
     Assert-Self ((Get-NormalizedId '{7971F918-A847-4430-9279-4A52D1EFE18D}') -eq '7971f918-a847-4430-9279-4a52d1efe18d') 'guid normalize'

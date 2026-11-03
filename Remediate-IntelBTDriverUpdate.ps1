@@ -4,9 +4,14 @@
 
 .DESCRIPTION
     Intune remediation pair. Upload each file as its own script. Intune runs
-    them with no arguments, so the default -Mode is the only difference:
+    them with no arguments. The files differ only by the default -Mode and
+    by PackageRole, which is written into the shared log:
       Detect-IntelBTDriverUpdate.ps1     default Detect
       Remediate-IntelBTDriverUpdate.ps1  default Remediate
+
+    Intune starts the remediation script only when detection exits 1.
+    A detection exit of 0 never starts remediation, so the log contains
+    only Detect lines. Both scripts append to the same file.
 
     Exit 0 = compliant / remediation succeeded.
     Exit 1 = the blocked driver is still offered, downloaded, or staged,
@@ -24,7 +29,7 @@
     Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.1
+    Version 2.1.2
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -51,7 +56,8 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.1'
+$script:ScriptVersion = '2.1.2'
+$script:PackageRole = 'Remediate'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
 $script:MicrosoftUpdateServiceId = '7971f918-a847-4430-9279-4a52d1efe18d'
@@ -97,9 +103,21 @@ function Initialize-Log {
 
 function Write-Status {
     param([int]$Code, [string]$Message)
-    if ($Message.Length -gt 1800) {
-        $Message = $Message.Substring(0, 1800) + '...[truncated]'
+    # Intune runs the remediation script only when detection exits 1.
+    # Exit 0 leaves no Remediate block in the log because that script never starts.
+    $suffix = ''
+    if ($script:PackageRole -eq 'Detect') {
+        if ($Code -eq 0) {
+            $suffix = ' Remediation did not run.'
+        } else {
+            $suffix = ' Intune should run the remediation script next. That run appends role=Remediate to this log.'
+        }
     }
+    $limit = 1800 - $suffix.Length
+    if ($Message.Length -gt $limit) {
+        $Message = $Message.Substring(0, $limit) + '...[truncated]'
+    }
+    $Message += $suffix
     Write-Log "EXIT $Code $Message"
     Write-Output $Message
     exit $Code
@@ -1082,7 +1100,7 @@ function Get-ActionSummary {
 }
 
 function Invoke-Detect {
-    Write-Log "=== Detect $script:ScriptVersion ==="
+    Write-Log "=== role=$script:PackageRole mode=$Mode version=$script:ScriptVersion ==="
     Write-EnvironmentLog
     $active = @(Get-ActiveBluetoothDrivers)
     foreach ($driver in $active) {
@@ -1103,7 +1121,7 @@ function Invoke-Detect {
 }
 
 function Invoke-Remediate {
-    Write-Log "=== Remediate $script:ScriptVersion ==="
+    Write-Log "=== role=$script:PackageRole mode=$Mode version=$script:ScriptVersion ==="
     Write-EnvironmentLog
     $active = @(Get-ActiveBluetoothDrivers)
     foreach ($driver in $active) {

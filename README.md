@@ -44,7 +44,9 @@ Both scripts append to `C:\temp\IntelBTDriverUpdate.txt`. The script creates `C:
 
 A compliant detection ends with `Remediation did not run.` and the file has only `role=Detect` lines. A remediation run appends a `role=Remediate` block to the same file. If the last line is exit 1 and there is still no `role=Remediate` block, the remediation script in the Intune package is missing or is a second copy of the detection file.
 
-An UpdateStore file matches only when Intel, Bluetooth, and 24.70.0.4 or 24.80.0.2 sit near each other. The log line `USO match` shows that text. If Windows Update has no matching update and the file is rewritten after a delete, remediation exits 1 and does not stop the update services again for 24 hours. Decline those two versions in the Intune driver update policy.
+An UpdateStore file matches only when Intel, Bluetooth, and 24.70.0.4 or 24.80.0.2 sit near each other. The log line `USO match` shows that text. Remediation also deletes the SQLite sidecars `store.db-wal`, `store.db-shm`, and `store.db-journal`, because the Update Orchestrator restores a paused offer from those files when its service starts. If Windows Update has no matching update and the file is rewritten after a delete, remediation exits 1 and does not stop the update services again for 24 hours.
+
+Pausing an approved driver is the Intune control. Pause does not decline it. If an older version of that same driver is still approved, Windows Update offers the older version.
 
 ## Check
 

@@ -29,7 +29,7 @@
     Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.3
+    Version 2.1.4
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -56,7 +56,7 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.3'
+$script:ScriptVersion = '2.1.4'
 $script:PackageRole = 'Remediate'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
@@ -338,6 +338,17 @@ function Join-ChildPath {
 function Get-UsoStoreRoot {
     if ([string]::IsNullOrWhiteSpace($env:ProgramData)) { return $null }
     return (Join-ChildPath $env:ProgramData 'USOPrivate\UpdateStore')
+}
+
+function Get-UsoSidecarPaths {
+    param([string]$Path)
+    # store.db is SQLite. Deleting the db alone lets the service restore the
+    # paused offer from store.db-wal or store.db-shm when usosvc starts.
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($suffix in @('-wal', '-shm', '-journal')) {
+        [void]$paths.Add($Path + $suffix)
+    }
+    return @($paths.ToArray())
 }
 
 function Get-DownloadRoot {
@@ -1138,7 +1149,23 @@ function Invoke-TargetedCleanup {
         }
     }
     $usoRoot = Get-UsoStoreRoot
+    $usoTargets = New-Object 'System.Collections.Generic.List[string]'
+    $seenUso = @{}
     foreach ($file in @($UsoHits)) {
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        $key = $file.ToLowerInvariant()
+        if (-not $seenUso.ContainsKey($key)) {
+            $seenUso[$key] = $true
+            [void]$usoTargets.Add($file)
+        }
+        foreach ($sidecar in @(Get-UsoSidecarPaths $file)) {
+            $sideKey = $sidecar.ToLowerInvariant()
+            if ($seenUso.ContainsKey($sideKey)) { continue }
+            $seenUso[$sideKey] = $true
+            if (Test-Path -LiteralPath $sidecar) { [void]$usoTargets.Add($sidecar) }
+        }
+    }
+    foreach ($file in @($usoTargets)) {
         try {
             if (Remove-BlockedChild -Parent $usoRoot -Candidate $file) {
                 [void]$removedUso.Add($file)
@@ -1297,6 +1324,10 @@ function Invoke-SelfTest {
     Assert-Self (Test-BlockedVersionText 'DriverVer=07/18/2026,24.70.0.4') 'inf driverver'
     Assert-Self (-not (Test-BlockedVersionText '24.70.0.40')) 'boundary helper'
     Assert-Self ((Get-NormalizedId '{7971F918-A847-4430-9279-4A52D1EFE18D}') -eq '7971f918-a847-4430-9279-4a52d1efe18d') 'guid normalize'
+    $sidecars = @(Get-UsoSidecarPaths 'C:\ProgramData\USOPrivate\UpdateStore\store.db')
+    Assert-Self ($sidecars -contains 'C:\ProgramData\USOPrivate\UpdateStore\store.db-wal') 'wal sidecar'
+    Assert-Self ($sidecars -contains 'C:\ProgramData\USOPrivate\UpdateStore\store.db-shm') 'shm sidecar'
+    Assert-Self ($sidecars -contains 'C:\ProgramData\USOPrivate\UpdateStore\store.db-journal') 'journal sidecar'
 
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('ibt-selftest-' + [guid]::NewGuid().ToString('n'))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null

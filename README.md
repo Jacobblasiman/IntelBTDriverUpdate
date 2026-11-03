@@ -36,7 +36,7 @@ Declining the driver in each Intune driver update policy is what stops a managed
 - They do not remove the Bluetooth driver bound to the adapter. `pnputil /delete-driver` is called without `/force` or `/uninstall`.
 - They match a version only when the update is Intel and Bluetooth, or the Bluetooth class GUID `{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}`, and only for 24.70.0.4 or 24.80.0.2. An Intel network driver is left alone.
 
-The log is `%ProgramData%\IntelBTDriverBlock\IntelBTDriverUpdate.log`.
+The log is `C:\temp\IntelBTDriverUpdate.txt`. The script creates `C:\temp` if it is missing.
 
 ## Check
 

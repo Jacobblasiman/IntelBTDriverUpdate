@@ -21,10 +21,10 @@
     The script relaunches itself with 64-bit Windows PowerShell when a 32-bit
     host starts it. Do not paste it through chat; brackets in type names get stripped.
 
-    Log: %ProgramData%\IntelBTDriverBlock\IntelBTDriverUpdate.log
+    Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.0
+    Version 2.1.1
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -51,18 +51,15 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.0'
+$script:ScriptVersion = '2.1.1'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
 $script:MicrosoftUpdateServiceId = '7971f918-a847-4430-9279-4a52d1efe18d'
 $script:WindowsUpdateServiceId = '9482f4b4-e343-43b6-b170-9a65bc822c77'
 $script:StoreServiceId = '855e8a7c-ecb4-4ca3-b045-1dfa50104289'
-if ([string]::IsNullOrWhiteSpace($env:ProgramData)) {
-    $script:LogDir = Join-Path ([IO.Path]::GetTempPath()) 'IntelBTDriverBlock'
-} else {
-    $script:LogDir = Join-Path $env:ProgramData 'IntelBTDriverBlock'
-}
-$script:LogFile = Join-Path $script:LogDir 'IntelBTDriverUpdate.log'
+# Intune runs as SYSTEM. C:\temp is the log location operators look at.
+$script:LogDir = 'C:\temp'
+$script:LogFile = 'C:\temp\IntelBTDriverUpdate.txt'
 # Pinned so the Windows Update agent is not collected while IsHidden is being set.
 # Releasing the searcher early is what surfaces 0x800706BA on the hide path.
 $script:ComPins = New-Object System.Collections.ArrayList
@@ -175,7 +172,7 @@ function Test-BytesContainBlockedVersion {
 function Test-BytesContainBlockedBluetooth {
     param([byte[]]$Bytes)
     if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return $false }
-    $samples = New-Object System.Collections.Generic.List[string]
+    $samples = New-Object 'System.Collections.Generic.List[string]'
     [void]$samples.Add([Text.Encoding]::GetEncoding(28591).GetString($Bytes))
     try { [void]$samples.Add([Text.Encoding]::Unicode.GetString($Bytes)) } catch { }
     try { [void]$samples.Add([Text.Encoding]::BigEndianUnicode.GetString($Bytes)) } catch { }
@@ -298,7 +295,7 @@ function Get-TopDownloadFolder {
 }
 
 function Get-UsoHits {
-    $hits = New-Object System.Collections.Generic.List[string]
+    $hits = New-Object 'System.Collections.Generic.List[string]'
     $root = Get-UsoStoreRoot
     if ([string]::IsNullOrWhiteSpace($root)) { return @() }
     if (-not (Test-Path -LiteralPath $root)) {
@@ -366,7 +363,7 @@ function Get-BlockedDownloadFolders {
 }
 
 function Get-ActiveBluetoothDrivers {
-    $drivers = New-Object System.Collections.Generic.List[object]
+    $drivers = New-Object 'System.Collections.Generic.List[object]'
     $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{' + $script:BluetoothClassGuid + '}'
     if (-not (Test-Path -LiteralPath $classKey)) { return @() }
     foreach ($child in @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue)) {
@@ -387,7 +384,7 @@ function Get-ActiveBluetoothDrivers {
 }
 
 function Get-PnpUtilPackages {
-    $packages = New-Object System.Collections.Generic.List[object]
+    $packages = New-Object 'System.Collections.Generic.List[object]'
     $pnputil = Join-ChildPath $env:SystemRoot 'System32\pnputil.exe'
     if (-not (Test-Path -LiteralPath $pnputil)) { return @() }
     $output = & $pnputil /enum-drivers 2>&1 | Out-String
@@ -415,7 +412,7 @@ function Get-PnpUtilPackages {
 }
 
 function Get-DriverStorePackages {
-    $packages = New-Object System.Collections.Generic.List[object]
+    $packages = New-Object 'System.Collections.Generic.List[object]'
     try {
         $drivers = @(Get-WindowsDriver -Online -ErrorAction Stop)
         $script:DriverStoreReadable = $true
@@ -446,7 +443,7 @@ function Get-StagedBlockedDrivers {
     foreach ($driver in @($ActiveDrivers)) {
         if ($driver.InfName) { $inUse[$driver.InfName.ToLowerInvariant()] = $true }
     }
-    $staged = New-Object System.Collections.Generic.List[object]
+    $staged = New-Object 'System.Collections.Generic.List[object]'
     foreach ($package in @(Get-DriverStorePackages)) {
         $blob = (@($package.ProviderName, $package.ClassName, $package.ClassGuid, $package.Version, $package.Driver) -join "`n")
         if (-not (Test-BlockedBluetoothText $blob)) { continue }
@@ -467,7 +464,7 @@ function Get-ActiveSummary {
     param($ActiveDrivers)
     $intel = @($ActiveDrivers | Where-Object { $_.ProviderName -match 'Intel' -or $_.DriverDesc -match 'Intel' })
     if ($intel.Count -eq 0) { return 'Active Intel Bluetooth driver: none found' }
-    $parts = New-Object System.Collections.Generic.List[string]
+    $parts = New-Object 'System.Collections.Generic.List[string]'
     foreach ($driver in $intel) {
         $inf = if ($driver.InfName) { $driver.InfName } else { 'no-inf' }
         [void]$parts.Add("$($driver.DriverVersion) ($inf)")
@@ -570,7 +567,7 @@ function Get-ComProperty {
 
 function Get-ComItems {
     param($Collection)
-    $items = New-Object System.Collections.Generic.List[object]
+    $items = New-Object 'System.Collections.Generic.List[object]'
     if ($null -eq $Collection) { return @() }
     $count = 0
     try { $count = [int]$Collection.Count } catch { return @() }
@@ -673,7 +670,7 @@ function Register-MicrosoftUpdateIfNeeded {
 
 function Get-SearchTargets {
     param($ServiceManager)
-    $targets = New-Object System.Collections.Generic.List[object]
+    $targets = New-Object 'System.Collections.Generic.List[object]'
     [void]$targets.Add([pscustomobject]@{ Label = 'Default'; Selection = 0; ServiceId = ''; Upgrade = $true })
     [void]$targets.Add([pscustomobject]@{ Label = 'Windows Update'; Selection = 2; ServiceId = ''; Upgrade = $true })
     [void]$targets.Add([pscustomobject]@{ Label = 'Microsoft Update'; Selection = 3; ServiceId = $script:MicrosoftUpdateServiceId; Upgrade = $false })
@@ -835,7 +832,7 @@ function Invoke-TargetSearch {
         $collected = @($first.Updates)
     } elseif ($AllowFallback -and $first.InvalidCriteria) {
         Write-Log "Combined driver criteria was rejected for $($Target.Label); searching each clause"
-        $clauseErrors = New-Object System.Collections.Generic.List[string]
+        $clauseErrors = New-Object 'System.Collections.Generic.List[string]'
         $allClauses = $true
         foreach ($simple in $script:SimpleDriverCriteria) {
             $one = Invoke-OneSearch -Session $Session -Target $Target -Criteria $simple
@@ -865,7 +862,7 @@ function Invoke-TargetSearch {
 function Invoke-UpdateScan {
     param([bool]$Hide)
     $found = @{}
-    $errors = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object 'System.Collections.Generic.List[string]'
     $muCompleted = $false
     $muError = ''
     $anyDriver = $false
@@ -940,7 +937,7 @@ function Set-UsoSuppressWindow {
 
 function Get-ComplianceReasons {
     param($Scan, $Staged, $UsoHits, $DownloadFolders)
-    $reasons = New-Object System.Collections.Generic.List[string]
+    $reasons = New-Object 'System.Collections.Generic.List[string]'
     foreach ($update in @($Scan.Updates)) {
         $label = if ($update.Title) { $update.Title } else { $update.Key }
         if (-not $update.IsHidden) {
@@ -987,7 +984,7 @@ function Get-ComplianceReasons {
 
 function Remove-StagedBlockedDrivers {
     param($Staged)
-    $removed = New-Object System.Collections.Generic.List[string]
+    $removed = New-Object 'System.Collections.Generic.List[string]'
     $pnputil = Join-ChildPath $env:SystemRoot 'System32\pnputil.exe'
     foreach ($driver in @($Staged)) {
         if ($driver.InUse) {
@@ -1020,8 +1017,8 @@ function Remove-StagedBlockedDrivers {
 
 function Invoke-TargetedCleanup {
     param($DownloadFolders, $UsoHits)
-    $removedDownloads = New-Object System.Collections.Generic.List[string]
-    $removedUso = New-Object System.Collections.Generic.List[string]
+    $removedDownloads = New-Object 'System.Collections.Generic.List[string]'
+    $removedUso = New-Object 'System.Collections.Generic.List[string]'
     if (@($DownloadFolders).Count -eq 0 -and @($UsoHits).Count -eq 0) {
         return [pscustomobject]@{ Downloads = @(); Uso = @() }
     }
@@ -1066,7 +1063,7 @@ function Start-SettingsRefresh {
 
 function Get-ActionSummary {
     param($FirstScan, $SecondScan, $RemovedStaged, $RemovedDownloads, $RemovedUso, $ActiveDrivers)
-    $actions = New-Object System.Collections.Generic.List[string]
+    $actions = New-Object 'System.Collections.Generic.List[string]'
     $seen = @{}
     foreach ($update in @(@($FirstScan.Updates) + @($SecondScan.Updates))) {
         if ($null -eq $update) { continue }
@@ -1155,7 +1152,7 @@ function Invoke-Remediate {
 }
 
 function Invoke-SelfTest {
-    $failures = New-Object System.Collections.Generic.List[string]
+    $failures = New-Object 'System.Collections.Generic.List[string]'
     function Assert-Self {
         param([bool]$Condition, [string]$Name)
         if (-not $Condition) {

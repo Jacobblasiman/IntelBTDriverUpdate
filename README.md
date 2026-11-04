@@ -57,3 +57,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Detect-IntelBTDriverUp
 ```
 
 SelfTest does not contact Windows Update. On a device, run each file with no arguments in 64-bit Windows PowerShell as SYSTEM.
+
+A run still has to search each update service online. It does not request a Windows Update service upgrade, and it does not search the superseded catalog or the full software catalog. The driver store is read with `pnputil /enum-drivers` unless that output cannot be parsed.

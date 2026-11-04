@@ -29,7 +29,7 @@
     Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.5
+    Version 2.1.6
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -56,7 +56,7 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.5'
+$script:ScriptVersion = '2.1.6'
 $script:PackageRole = 'Remediate'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
@@ -410,39 +410,60 @@ function Get-UsoHits {
     return @($hits.ToArray())
 }
 
+function Test-DownloadFileBlocked {
+    param($File)
+    $ext = $File.Extension.ToLowerInvariant()
+    if (Test-BlockedVersionText $File.Name) { return $true }
+    if ($ext -eq '.inf' -or $ext -eq '.xml' -or $ext -eq '.txt') {
+        if ($File.Length -gt 5MB) { return $false }
+        try { $text = Read-TextFlexible $File.FullName } catch { return $false }
+        return (Test-BlockedBluetoothText $text)
+    }
+    return $false
+}
+
+function Test-CabSampleBlocked {
+    param($File)
+    try {
+        $stream = [IO.File]::Open($File.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $length = [int][Math]::Min([int64]2MB, [int64]$stream.Length)
+            if ($length -le 0) { return $false }
+            $buffer = New-Object byte[] $length
+            [void]$stream.Read($buffer, 0, $buffer.Length)
+        } finally { $stream.Dispose() }
+        return (Test-BytesContainBlockedBluetooth $buffer)
+    } catch { return $false }
+}
+
 function Get-BlockedDownloadFolders {
     $found = @{}
     $root = Get-DownloadRoot
     if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { return @() }
-    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)
-    foreach ($file in $files) {
-        $folder = $null
-        $ext = $file.Extension.ToLowerInvariant()
-        if ($ext -eq '.inf' -or $ext -eq '.xml' -or $ext -eq '.txt') {
-            if ($file.Length -gt 5MB) { continue }
-            try {
-                $text = Read-TextFlexible $file.FullName
-            } catch { continue }
-            if (Test-BlockedBluetoothText $text) {
-                $folder = Get-TopDownloadFolder -Root $root -FullName $file.FullName
-            }
-        } elseif (Test-BlockedVersionText $file.Name) {
-            $folder = Get-TopDownloadFolder -Root $root -FullName $file.FullName
-        } elseif ($ext -eq '.cab' -or $ext -eq '.msu' -or $ext -eq '.esd') {
-            try {
-                $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-                try {
-                    $length = [int][Math]::Min([int64]2MB, [int64]$stream.Length)
-                    if ($length -le 0) { continue }
-                    $buffer = New-Object byte[] $length
-                    [void]$stream.Read($buffer, 0, $buffer.Length)
-                } finally { $stream.Dispose() }
-                if (Test-BytesContainBlockedBluetooth $buffer) {
-                    $folder = Get-TopDownloadFolder -Root $root -FullName $file.FullName
-                }
-            } catch { }
+    $tops = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)
+    foreach ($top in $tops) {
+        $folder = Get-TopDownloadFolder -Root $root -FullName $top.FullName
+        if ([string]::IsNullOrWhiteSpace($folder) -or $found.ContainsKey($folder)) { continue }
+        $files = @($top)
+        if ($top.PSIsContainer) {
+            $files = @(Get-ChildItem -LiteralPath $top.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)
         }
-        if ($folder) { $found[$folder] = $true }
+        $matched = $false
+        $cabs = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($file in $files) {
+            $ext = $file.Extension.ToLowerInvariant()
+            if ($ext -eq '.cab' -or $ext -eq '.msu' -or $ext -eq '.esd') {
+                if ($cabs.Count -lt 2) { [void]$cabs.Add($file) }
+                continue
+            }
+            if (Test-DownloadFileBlocked $file) { $matched = $true; break }
+        }
+        if (-not $matched) {
+            foreach ($cab in $cabs.ToArray()) {
+                if (Test-CabSampleBlocked $cab) { $matched = $true; break }
+            }
+        }
+        if ($matched) { $found[$folder] = $true }
     }
     return @($found.Keys)
 }
@@ -497,6 +518,13 @@ function Get-PnpUtilPackages {
 }
 
 function Get-DriverStorePackages {
+    # pnputil returns the third-party store in seconds. Get-WindowsDriver -Online
+    # walks the whole image and is the slow path when pnputil is unreadable.
+    $fallback = @(Get-PnpUtilPackages)
+    if ($script:DriverStoreReadable -and $fallback.Count -gt 0) {
+        Write-Log "Driver store enumerated with pnputil ($($fallback.Count) packages)"
+        return $fallback
+    }
     $packages = New-Object 'System.Collections.Generic.List[object]'
     try {
         $drivers = @(Get-WindowsDriver -Online -ErrorAction Stop)
@@ -758,8 +786,10 @@ function Register-MicrosoftUpdateIfNeeded {
 function Get-SearchTargets {
     param($ServiceManager)
     $targets = New-Object 'System.Collections.Generic.List[object]'
-    [void]$targets.Add([pscustomobject]@{ Label = 'Default'; Selection = 0; ServiceId = ''; Upgrade = $true })
-    [void]$targets.Add([pscustomobject]@{ Label = 'Windows Update'; Selection = 2; ServiceId = ''; Upgrade = $true })
+    # Upgrade and the superseded catalog make each online search take minutes.
+    # The offered driver is current, so neither is required to see it.
+    [void]$targets.Add([pscustomobject]@{ Label = 'Default'; Selection = 0; ServiceId = ''; Upgrade = $false })
+    [void]$targets.Add([pscustomobject]@{ Label = 'Windows Update'; Selection = 2; ServiceId = ''; Upgrade = $false })
     [void]$targets.Add([pscustomobject]@{ Label = 'Microsoft Update'; Selection = 3; ServiceId = $script:MicrosoftUpdateServiceId; Upgrade = $false })
 
     $known = @{
@@ -801,7 +831,7 @@ function Set-SearcherTarget {
     }
     try { $Searcher.CanAutomaticallyUpgradeService = [bool]$Target.Upgrade } catch { }
     try { $Searcher.Online = $true } catch { }
-    try { $Searcher.IncludePotentiallySupersededUpdates = $true } catch { }
+    try { $Searcher.IncludePotentiallySupersededUpdates = $false } catch { }
 }
 
 function Invoke-OneSearch {
@@ -970,12 +1000,6 @@ function Invoke-UpdateScan {
         }
         if ($outcome.Completed) { $anyDriver = $true }
         elseif ($outcome.Error) { [void]$errors.Add("$($target.Label): $($outcome.Error)") }
-    }
-
-    $allTypes = [pscustomobject]@{ Label = 'Default (all types)'; Selection = 0; ServiceId = ''; Upgrade = $true }
-    $allOutcome = Invoke-TargetSearch -Session $session -Target $allTypes -Criteria 'IsInstalled=0' -Hide:$Hide -Found $found -AllowFallback $false
-    if (-not $allOutcome.Completed -and $allOutcome.Error) {
-        [void]$errors.Add("Default all-types: $($allOutcome.Error)")
     }
 
     return [pscustomobject]@{

@@ -29,7 +29,7 @@
     Log: C:\temp\IntelBTDriverUpdate.txt
 
 .NOTES
-    Version 2.1.4
+    Version 2.1.5
     A default IUpdateSearcher does not see every driver Settings shows. Settings
     and USO can offer a driver from Microsoft Update, as an optional (BrowseOnly /
     IsAssigned=0) driver, or from a stale USO UpdateStore record. Hiding through
@@ -56,7 +56,7 @@ if ($Mode -ne 'SelfTest' -and [Environment]::Is64BitOperatingSystem -and -not [E
     }
 }
 
-$script:ScriptVersion = '2.1.4'
+$script:ScriptVersion = '2.1.5'
 $script:PackageRole = 'Detect'
 $script:BlockedVersions = @('24.70.0.4', '24.80.0.2')
 $script:BluetoothClassGuid = 'e0cbf06c-cd8b-4647-bb8a-263b43f0f974'
@@ -1248,35 +1248,48 @@ function Invoke-Remediate {
     # while Windows Update had nothing to hide. Do not stop the update stack again.
     if ((Test-UsoReplayActive) -and @($scan.Updates).Count -eq 0 -and @($downloads).Count -eq 0 -and @($uso).Count -gt 0 -and $removableStaged.Count -eq 0) {
         Write-Log 'USO still has the blocked text after an earlier delete. Windows Update has no matching update. Leaving the update stack running.'
-        Write-Status -Code 1 -Message 'Still present: USO recreated a blocked Intel Bluetooth reference and Windows Update returned no update to hide. Decline 24.70.0.4 and 24.80.0.2 in every Intune driver update policy. The update stack was not stopped again.'
+        Write-Status -Code 1 -Message 'Still present: the paused Intel Bluetooth driver is still in the local update list and Windows Update has no record to hide. Pause every approved version of that driver. Pausing only the newest one makes Windows offer the previous approved version. The update stack was not stopped again.'
     }
     $cleanup = Invoke-TargetedCleanup -DownloadFolders $downloads -UsoHits $uso
     $removedStaged = @(Remove-StagedBlockedDrivers $staged)
-    Start-SettingsRefresh
-
-    $scan2 = Invoke-UpdateScan -Hide $true
+    $hidSomething = @($scan.Updates | Where-Object { $_.Action -eq 'Hidden' }).Count -gt 0
+    # An interactive scan rebuilds the Settings list. When Windows Update had
+    # nothing to hide, that scan is what puts the paused driver back on screen.
+    if ($hidSomething -or @($cleanup.Downloads).Count -gt 0 -or @($removedStaged).Count -gt 0) {
+        Start-SettingsRefresh
+        $scan2 = Invoke-UpdateScan -Hide $true
+    } else {
+        Write-Log 'Not starting an update scan. Windows Update had no record to hide, and a scan puts the driver back into Settings.'
+        Start-Sleep -Seconds 20
+        $scan2 = $scan
+    }
     $active2 = @(Get-ActiveBluetoothDrivers)
     $staged2 = @(Get-StagedBlockedDrivers $active2)
     $downloads2 = @(Get-BlockedDownloadFolders)
     $uso2 = @(Get-UsoHits)
     $offeredAgain = @($scan2.Updates | Where-Object { -not $_.IsHidden })
     $usoCameBack = $false
-    if (($uso2.Count -gt 0 -or $downloads2.Count -gt 0) -and $offeredAgain.Count -eq 0) {
-        if (@($uso2).Count -gt 0 -and @($scan2.Updates).Count -eq 0 -and @($downloads2).Count -eq 0) {
-            $usoCameBack = $true
+    if ($hidSomething -or @($cleanup.Downloads).Count -gt 0 -or @($removedStaged).Count -gt 0) {
+        if (($uso2.Count -gt 0 -or $downloads2.Count -gt 0) -and $offeredAgain.Count -eq 0) {
+            if (@($uso2).Count -gt 0 -and @($scan2.Updates).Count -eq 0 -and @($downloads2).Count -eq 0) {
+                $usoCameBack = $true
+            }
+            $cleanup2 = Invoke-TargetedCleanup -DownloadFolders $downloads2 -UsoHits $uso2
+            $uso2 = @(Get-UsoHits)
+            $downloads2 = @(Get-BlockedDownloadFolders)
+            $cleanup = [pscustomobject]@{
+                Downloads = @(@($cleanup.Downloads) + @($cleanup2.Downloads))
+                Uso       = @(@($cleanup.Uso) + @($cleanup2.Uso))
+            }
         }
-        $cleanup2 = Invoke-TargetedCleanup -DownloadFolders $downloads2 -UsoHits $uso2
-        $uso2 = @(Get-UsoHits)
-        $downloads2 = @(Get-BlockedDownloadFolders)
-        $cleanup = [pscustomobject]@{
-            Downloads = @(@($cleanup.Downloads) + @($cleanup2.Downloads))
-            Uso       = @(@($cleanup.Uso) + @($cleanup2.Uso))
-        }
+    } elseif (@($uso2).Count -gt 0 -or @($cleanup.Uso).Count -gt 0) {
+        # Do not delete again and do not scan. The next scan puts the offer back.
+        $usoCameBack = $true
     }
     $reasons = @(Get-ComplianceReasons -Scan $scan2 -Staged $staged2 -UsoHits $uso2 -DownloadFolders $downloads2)
     if ($usoCameBack) {
         Set-UsoReplayWindow
-        $reasons = @(@($reasons) + @('USO recreated the blocked text during the rescan and Windows Update has no matching update'))
+        $reasons = @(@($reasons) + @('Windows Update has no record to hide. The next scan puts this driver back while any version of it remains approved.'))
     }
     $summary = Get-ActionSummary -FirstScan $scan -SecondScan $scan2 -RemovedStaged $removedStaged -RemovedDownloads $cleanup.Downloads -RemovedUso $cleanup.Uso -ActiveDrivers $active2
     # A file that still contains the offer is what Settings shows. Do not report
@@ -1286,7 +1299,7 @@ function Invoke-Remediate {
         $policyNote = ''
         $unseen = @($reasons | Where-Object { $_ -like 'USO*' -or $_ -like 'Inconclusive:*' -or $_ -like '*Hide failed*' -or $_ -like '*mandatory*' })
         if ($unseen.Count -gt 0) {
-            $policyNote = ' Decline 24.70.0.4 and 24.80.0.2 in every Intune driver update policy if a local hide does not stick.'
+            $policyNote = ' Pause every approved version of this Intel Bluetooth driver. Pausing only the newest version makes Windows offer the previous approved one.'
         }
         Write-Status -Code 1 -Message ("Still present: " + ($reasons -join ' | ') + " | $summary" + $policyNote)
     }

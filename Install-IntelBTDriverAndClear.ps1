@@ -21,7 +21,7 @@
     delete the download cache, or clear RebootRequired.
 
 .NOTES
-    Version 1.0.1
+    Version 1.0.2
     Log: C:\temp\IntelBTDriverUpdate.txt
 #>
 [CmdletBinding()]
@@ -35,7 +35,7 @@ $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
 
-$script:ScriptVersion = '1.0.1'
+$script:ScriptVersion = '1.0.2'
 $script:TargetVersion = [version]'24.80.0.2'
 $script:PackageUrl = 'https://downloadmirror.intel.com/930964/BT-24.80.0-64UWD-Win10-Win11.exe'
 $script:PackageSha512 = 'dd5335728d36d79c787c0592784e8c345f2c38d0ca245b5bcc50b1f99026e01b529b3921e20d7c26e16708354aa798839823dd591e86cf87a1803dc1a22e66c9'
@@ -50,7 +50,9 @@ $script:ServiceNames = @('WaaSMedicSvc', 'usosvc', 'dosvc', 'bits', 'wuauserv')
 function Write-Log {
     param([string]$Message)
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    Write-Output $line
+    # Host only. Write-Output becomes part of a function's return value, so a
+    # captured path was the log sentence plus the real installer path.
+    Write-Host $line
     if ($Mode -eq 'SelfTest') { return }
     try {
         $dir = Split-Path -Parent $script:LogPath
@@ -59,7 +61,7 @@ function Write-Log {
         }
         Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
     } catch {
-        Write-Output ("{0} log write failed: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message)
+        Write-Host ("{0} log write failed: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message)
     }
 }
 
@@ -118,9 +120,9 @@ function Read-StoreBytes {
         if ($read -lt $buffer.Length) {
             $exact = New-Object byte[] $read
             [Array]::Copy($buffer, $exact, $read)
-            return $exact
+            return ,$exact
         }
-        return $buffer
+        return ,$buffer
     } catch {
         Write-Log "Could not read store.db: $($_.Exception.Message)"
         return $null

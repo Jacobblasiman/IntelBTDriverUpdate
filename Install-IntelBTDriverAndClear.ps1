@@ -13,15 +13,16 @@
     after 24.80.0.2 would downgrade the adapter and make 24.80.0.2 applicable
     again. A newer approved driver, such as 24.90.0.3, can still be offered.
 
-    The Intel installer is started with /quiet /norestart and
-    REBOOT=ReallySuppress. This script does not reboot the PC.
+    The package's documented /quiet switch installs with no prompts and then
+    reboots. This script does not launch that package. It installs the embedded
+    MSI with REBOOT=ReallySuppress and does not reboot the PC.
 
     Run once as SYSTEM in 64-bit Windows PowerShell. Do not schedule it as the
     daily Intune remediation. It does not set ExcludeWUDriversInQualityUpdate,
     delete the download cache, or clear RebootRequired.
 
 .NOTES
-    Version 1.0.2
+    Version 1.0.3
     Log: C:\temp\IntelBTDriverUpdate.txt
 #>
 [CmdletBinding()]
@@ -35,7 +36,11 @@ $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
 
-$script:ScriptVersion = '1.0.2'
+$script:ScriptVersion = '1.0.3'
+# Fixed for package SHA512 above. #Setup.cab is stored inside this MSI.
+$script:EmbeddedMsiOffset = 4271508
+$script:EmbeddedMsiLength = 22245376
+$script:EmbeddedMsiSha256 = '6dad9d2be094c4f4eb0277d0f263266a56e34a9fbb2f7747b6ca8367114448d3'
 $script:TargetVersion = [version]'24.80.0.2'
 $script:PackageUrl = 'https://downloadmirror.intel.com/930964/BT-24.80.0-64UWD-Win10-Win11.exe'
 $script:PackageSha512 = 'dd5335728d36d79c787c0592784e8c345f2c38d0ca245b5bcc50b1f99026e01b529b3921e20d7c26e16708354aa798839823dd591e86cf87a1803dc1a22e66c9'
@@ -303,18 +308,79 @@ function Save-DriverPackage {
     return $dest
 }
 
+function Get-MsiexecPath {
+    if (-not [Environment]::Is64BitProcess) {
+        $native = Join-Path $env:WinDir 'SysNative\msiexec.exe'
+        if (Test-Path -LiteralPath $native) { return $native }
+    }
+    $system = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    if (Test-Path -LiteralPath $system) { return $system }
+    return $null
+}
+
+function Stop-PendingRestart {
+    $shutdown = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+    if (-not (Test-Path -LiteralPath $shutdown)) { return }
+    $proc = Start-Process -FilePath $shutdown -ArgumentList '/a' -Wait -PassThru -WindowStyle Hidden
+    if ($proc.ExitCode -eq 0) {
+        Write-Log 'Canceled a pending restart'
+    }
+}
+
+function Export-EmbeddedMsi {
+    param([string]$PackagePath)
+    $dir = 'C:\temp\IntelBTDriverPackages'
+    $dest = Join-Path $dir 'IntelBluetooth.msi'
+    $packageFile = $null
+    $sha = $null
+    try {
+        $packageFile = [IO.File]::Open($PackagePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $end = [int64]$script:EmbeddedMsiOffset + [int64]$script:EmbeddedMsiLength
+        if ($packageFile.Length -lt $end) {
+            throw 'Package is smaller than the embedded installer'
+        }
+        $packageFile.Position = $script:EmbeddedMsiOffset
+        $buffer = New-Object byte[] $script:EmbeddedMsiLength
+        $read = 0
+        while ($read -lt $buffer.Length) {
+            $got = $packageFile.Read($buffer, $read, $buffer.Length - $read)
+            if ($got -le 0) { throw 'Could not read the embedded installer' }
+            $read += $got
+        }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $hash = ([BitConverter]::ToString($sha.ComputeHash($buffer))).Replace('-', '')
+        if (-not (Test-HashEqual $hash $script:EmbeddedMsiSha256)) {
+            throw 'Embedded installer hash did not match'
+        }
+        [IO.File]::WriteAllBytes($dest, $buffer)
+    } finally {
+        if ($null -ne $packageFile) { $packageFile.Dispose() }
+        if ($null -ne $sha) { $sha.Dispose() }
+    }
+    Write-Log "Extracted the embedded installer to $dest"
+    return $dest
+}
+
 function Install-DriverPackage {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Installer file was not found: $Path"
     }
-    Write-Log "Installing $Path /quiet /norestart"
-    $proc = Start-Process -FilePath $Path -ArgumentList '/quiet /norestart REBOOT=ReallySuppress' -Wait -PassThru -WindowStyle Hidden
+    $msi = Export-EmbeddedMsi -PackagePath $Path
+    $msiexec = Get-MsiexecPath
+    if (-not $msiexec) { throw 'msiexec.exe was not found' }
+    $log = 'C:\temp\IntelBTDriverUpdate-msi.log'
+    # Do not run the downloaded exe. Its /quiet switch reboots on its own.
+    $arguments = "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress /l*v `"$log`""
+    Write-Log "Installing embedded MSI with REBOOT=ReallySuppress"
+    $proc = Start-Process -FilePath $msiexec -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+    Stop-PendingRestart
     $code = $proc.ExitCode
     Write-Log "Installer exit code $code"
-    if ($code -eq 0 -or $code -eq 3010) { return $true }
+    if ($code -eq 3010) { return 'pending' }
+    if ($code -eq 0) { return 'installed' }
     Write-Log 'Installer failed. The update cache was not cleared.'
-    return $false
+    return 'failed'
 }
 
 function Clear-UpdateOfferCache {
@@ -355,6 +421,9 @@ function Invoke-SelfTest {
     if ((ConvertTo-DriverVersion '24.70.0.4') -ge $script:TargetVersion) { [void]$failures.Add('older compare') }
     if ((ConvertTo-DriverVersion '24.80.0.2') -lt (ConvertTo-DriverVersion '24.70.0.4')) { [void]$failures.Add('order') }
     if (-not (Test-HashEqual $script:PackageSha512.ToUpperInvariant() $script:PackageSha512)) { [void]$failures.Add('hash case') }
+    if ($script:EmbeddedMsiSha256.Length -ne 64 -or $script:EmbeddedMsiOffset -le 0 -or $script:EmbeddedMsiLength -le 0) {
+        [void]$failures.Add('embedded msi')
+    }
     if (-not (Test-OfferText 'Intel Corporation Bluetooth Driver Update (24.70.0.4)')) { [void]$failures.Add('title') }
     if (Test-OfferText 'Intel Corporation - Net - 24.70.0.4') { [void]$failures.Add('wifi') }
     if ($failures.Count -gt 0) {
@@ -379,6 +448,7 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 $exitCode = 0
 $taskDisabled = $false
 $stackTouched = $false
+$deferFinish = $false
 try {
     Write-Log "=== Install-IntelBTDriverAndClear version=$script:ScriptVersion ==="
     $installed = @(Get-InstalledBluetoothVersions)
@@ -399,13 +469,19 @@ try {
         if (-not (Wait-UpdateStackStopped)) {
             throw 'Windows Update did not stop before the driver install'
         }
-        if (-not (Install-DriverPackage $package)) {
+        $installResult = Install-DriverPackage $package
+        if ($installResult -eq 'failed') {
             throw 'Intel Bluetooth package did not install'
         }
         $installed = @(Get-InstalledBluetoothVersions)
         $stillOld = @($installed | Where-Object { $_ -lt $script:TargetVersion })
         if ($installed.Count -eq 0 -or $stillOld.Count -gt 0) {
-            throw 'Installed Intel Bluetooth driver is still older than 24.80.0.2. The update cache was not cleared.'
+            if ($installResult -eq 'pending') {
+                Write-Log 'The package is installed. Windows will switch to the new driver at the next restart. This script did not restart the PC, and it left the update cache in place.'
+                $deferFinish = $true
+            } else {
+                throw 'Installed Intel Bluetooth driver is still older than 24.80.0.2. The update cache was not cleared.'
+            }
         }
     }
     if (-not $stackTouched) {
@@ -416,8 +492,12 @@ try {
         }
         $stackTouched = $true
     }
-    Clear-UpdateOfferCache
-    Write-Log 'Cached update offer removed. Starting one check for updates.'
+    if ($deferFinish) {
+        Write-Log 'Skipped the update-cache clear because the new driver is not running yet.'
+    } else {
+        Clear-UpdateOfferCache
+        Write-Log 'Cached update offer removed. Starting one check for updates.'
+    }
 } catch {
     $detail = $_.Exception.Message
     $lineNo = $_.InvocationInfo.ScriptLineNumber
@@ -440,7 +520,7 @@ try {
     }
 }
 
-if ($exitCode -eq 0) {
+if ($exitCode -eq 0 -and -not $deferFinish) {
     $uso = Join-Path $env:SystemRoot 'System32\UsoClient.exe'
     if (Test-Path -LiteralPath $uso) {
         Start-Process -FilePath $uso -ArgumentList 'StartScan' -WindowStyle Hidden | Out-Null

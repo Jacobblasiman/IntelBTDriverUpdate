@@ -21,7 +21,7 @@
     delete the download cache, or clear RebootRequired.
 
 .NOTES
-    Version 1.0.0
+    Version 1.0.1
     Log: C:\temp\IntelBTDriverUpdate.txt
 #>
 [CmdletBinding()]
@@ -35,7 +35,7 @@ $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
 
-$script:ScriptVersion = '1.0.0'
+$script:ScriptVersion = '1.0.1'
 $script:TargetVersion = [version]'24.80.0.2'
 $script:PackageUrl = 'https://downloadmirror.intel.com/930964/BT-24.80.0-64UWD-Win10-Win11.exe'
 $script:PackageSha512 = 'dd5335728d36d79c787c0592784e8c345f2c38d0ca245b5bcc50b1f99026e01b529b3921e20d7c26e16708354aa798839823dd591e86cf87a1803dc1a22e66c9'
@@ -196,19 +196,40 @@ function Start-UpdateStack {
 
 function Set-MedicTask {
     param([bool]$Enable)
-    $task = Get-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName -ErrorAction SilentlyContinue
+    $task = $null
+    try {
+        $task = Get-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName -ErrorAction Stop
+    } catch {
+        Write-Log "Medic task was not read: $($_.Exception.Message)"
+        return $false
+    }
     if ($null -eq $task) {
         Write-Log "Medic task $($script:MedicTaskPath)$($script:MedicTaskName) was not found"
         return $false
     }
-    if ($Enable) {
-        Enable-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName | Out-Null
-        Write-Log 'Enabled Windows Update Medic task PerformRemediation'
-    } else {
-        Disable-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName | Out-Null
-        Write-Log 'Disabled Windows Update Medic task PerformRemediation'
+    try {
+        if ($Enable) {
+            Enable-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName -ErrorAction Stop | Out-Null
+            Write-Log 'Enabled Windows Update Medic task PerformRemediation'
+        } else {
+            Disable-ScheduledTask -TaskPath $script:MedicTaskPath -TaskName $script:MedicTaskName -ErrorAction Stop | Out-Null
+            Write-Log 'Disabled Windows Update Medic task PerformRemediation'
+        }
+    } catch {
+        Write-Log "Medic task was not changed: $($_.Exception.Message)"
+        return $false
     }
     return $true
+}
+
+function Get-CurlPath {
+    if (-not [Environment]::Is64BitProcess) {
+        $native = Join-Path $env:WinDir 'SysNative\curl.exe'
+        if (Test-Path -LiteralPath $native) { return $native }
+    }
+    $system = Join-Path $env:SystemRoot 'System32\curl.exe'
+    if (Test-Path -LiteralPath $system) { return $system }
+    return $null
 }
 
 function Save-DriverPackage {
@@ -217,8 +238,60 @@ function Save-DriverPackage {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     $dest = Join-Path $dir $script:PackageName
+    if (Test-Path -LiteralPath $dest) {
+        $existing = (Get-FileHash -LiteralPath $dest -Algorithm SHA512).Hash
+        if (Test-HashEqual $existing $script:PackageSha512) {
+            Write-Log "Using existing $($script:PackageName); the SHA512 matched"
+            return $dest
+        }
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+    }
     Write-Log "Downloading $($script:PackageUrl)"
-    Invoke-WebRequest -Uri $script:PackageUrl -OutFile $dest -UseBasicParsing
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $curl = Get-CurlPath
+    if ($curl) {
+        $output = & $curl -fL --retry 3 --retry-delay 2 -A 'IntelBTDriverUpdate' -o $dest $script:PackageUrl 2>&1
+        $code = $LASTEXITCODE
+        $size = 0
+        if (Test-Path -LiteralPath $dest) { $size = (Get-Item -LiteralPath $dest).Length }
+        if ($code -eq 0 -and $size -gt 0) {
+            Write-Log "curl.exe downloaded $size bytes"
+        } else {
+            $text = ($output | Out-String).Trim()
+            if ($text.Length -gt 500) { $text = $text.Substring(0, 500) }
+            [void]$errors.Add("curl.exe exit ${code}: $text")
+            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        [void]$errors.Add('curl.exe was not found')
+    }
+    if (-not (Test-Path -LiteralPath $dest)) {
+        # Invoke-WebRequest under SYSTEM looks up the current user's Internet
+        # Settings key. When that profile is not loaded, Windows returns
+        # "The system cannot find the file specified" before any download.
+        try {
+            $proxy = [Net.WebRequest]::GetSystemWebProxy()
+            $proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+            [Net.WebRequest]::DefaultWebProxy = $proxy
+        } catch {
+            Write-Log "Per-user proxy lookup failed: $($_.Exception.Message). Downloading without that proxy."
+            [Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+        }
+        $client = New-Object System.Net.WebClient
+        try {
+            $client.Headers['User-Agent'] = 'IntelBTDriverUpdate'
+            $client.DownloadFile($script:PackageUrl, $dest)
+        } catch {
+            [void]$errors.Add("WebClient: $($_.Exception.Message)")
+            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        } finally {
+            $client.Dispose()
+        }
+    }
+    if (-not (Test-Path -LiteralPath $dest)) {
+        throw ("Download failed. " + ($errors -join ' | '))
+    }
     $hash = (Get-FileHash -LiteralPath $dest -Algorithm SHA512).Hash
     if (-not (Test-HashEqual $hash $script:PackageSha512)) {
         Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
@@ -230,6 +303,9 @@ function Save-DriverPackage {
 
 function Install-DriverPackage {
     param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Installer file was not found: $Path"
+    }
     Write-Log "Installing $Path /quiet /norestart"
     $proc = Start-Process -FilePath $Path -ArgumentList '/quiet /norestart REBOOT=ReallySuppress' -Wait -PassThru -WindowStyle Hidden
     $code = $proc.ExitCode
@@ -341,7 +417,12 @@ try {
     Clear-UpdateOfferCache
     Write-Log 'Cached update offer removed. Starting one check for updates.'
 } catch {
-    Write-Log ("Install-and-clear error: " + $_.Exception.Message)
+    $detail = $_.Exception.Message
+    $lineNo = $_.InvocationInfo.ScriptLineNumber
+    $command = $_.InvocationInfo.Line
+    if ($command) { $command = $command.Trim() }
+    Write-Log "Install-and-clear error (line ${lineNo}): $detail"
+    if ($command) { Write-Log "Failed command: $command" }
     $exitCode = 1
 } finally {
     if ($stackTouched) {
